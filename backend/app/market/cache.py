@@ -27,7 +27,10 @@ class PriceCache:
         If this is the first update for the ticker, previous_price == price (direction='flat').
         """
         with self._lock:
-            ts = timestamp or time.time()
+            if timestamp is None:
+                ts = time.time()
+            else:
+                ts = timestamp
             prev = self._prices.get(ticker)
             previous_price = prev.price if prev else price
 
