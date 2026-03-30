@@ -167,6 +167,7 @@ Both the simulator and the Massive client implement the same abstract interface.
 ### Shared Price Cache
 
 - A single background task (simulator or Massive poller) writes to an in-memory price cache
+- The cache is **watchlist-driven**: it tracks only tickers currently in the user's watchlist. When a ticker is removed from the watchlist it is also removed from the cache.
 - The cache holds the latest price, previous price, and timestamp for each ticker
 - SSE streams read from this cache and push updates to connected clients
 - This architecture supports future multi-user scenarios without changes to the data layer
@@ -175,9 +176,27 @@ Both the simulator and the Massive client implement the same abstract interface.
 
 - Endpoint: `GET /api/stream/prices`
 - Long-lived SSE connection; client uses native `EventSource` API
-- Server pushes price updates for all tickers known to the system at a regular cadence (~500ms) — in the single-user model this is equivalent to the user's watchlist
-- Each SSE event contains ticker, price, previous price, timestamp, and change direction
+- Server pushes price updates for all watchlist tickers at a fixed cadence of **500ms**, regardless of the underlying data source poll rate. When Massive API is used, cached prices are re-pushed between polls — the frontend always receives updates at 500ms.
 - Client handles reconnection automatically (EventSource has built-in retry)
+
+**SSE event shape** (JSON, one object per `data:` line):
+
+```json
+{
+  "ticker": "AAPL",
+  "price": 192.34,
+  "prev_price": 191.80,
+  "change": 0.54,
+  "change_pct": 0.28,
+  "direction": "up",
+  "timestamp": "2026-03-26T14:32:01.123Z"
+}
+```
+
+- `direction`: `"up"` | `"down"` | `"flat"` — derived server-side from `price` vs `prev_price`
+- `change`: absolute price delta (positive or negative)
+- `change_pct`: percentage change, rounded to 2 decimal places
+- `timestamp`: ISO 8601 UTC
 
 ---
 
@@ -207,7 +226,7 @@ All tables include a `user_id` column defaulting to `"default"`. This is hardcod
 - `added_at` TEXT (ISO timestamp)
 - UNIQUE constraint on `(user_id, ticker)`
 
-**positions** — Current holdings (one row per ticker per user)
+**positions** — Current holdings (one row per ticker per user). When a sell reduces `quantity` to zero the row is deleted entirely — zero-quantity rows are never left in place.
 - `id` TEXT PRIMARY KEY (UUID)
 - `user_id` TEXT (default: `"default"`)
 - `ticker` TEXT
@@ -225,7 +244,7 @@ All tables include a `user_id` column defaulting to `"default"`. This is hardcod
 - `price` REAL
 - `executed_at` TEXT (ISO timestamp)
 
-**portfolio_snapshots** — Portfolio value over time (for P&L chart). Recorded every 30 seconds by a background task, and immediately after each trade execution.
+**portfolio_snapshots** — Portfolio value over time (for P&L chart). Recorded every 30 seconds by a background task, and immediately after each trade execution. Capped at **5000 rows per user** (≈41 hours of 30s snapshots); when the cap is reached the oldest rows are deleted to make room.
 - `id` TEXT PRIMARY KEY (UUID)
 - `user_id` TEXT (default: `"default"`)
 - `total_value` REAL
@@ -290,7 +309,7 @@ There is an OPENROUTER_API_KEY in the .env file in the project root.
 When the user sends a chat message, the backend:
 
 1. Loads the user's current portfolio context (cash, positions with P&L, watchlist with live prices, total portfolio value)
-2. Loads recent conversation history from the `chat_messages` table
+2. Loads the **20 most recent messages** from `chat_messages` (10 exchanges). This bounds context window usage while retaining enough history for coherent multi-turn conversations.
 3. Constructs a prompt with a system message, portfolio context, conversation history, and the user's new message
 4. Calls the LLM via LiteLLM → OpenRouter, requesting structured output, using the cerebras-inference skill
 5. Parses the complete structured JSON response
@@ -310,13 +329,17 @@ The LLM is instructed to respond with JSON matching this schema:
   ],
   "watchlist_changes": [
     {"ticker": "PYPL", "action": "add"}
+  ],
+  "errors": [
+    {"ticker": "TSLA", "reason": "Insufficient cash to buy 50 shares at $245.00"}
   ]
 }
 ```
 
 - `message` (required): The conversational text shown to the user
 - `trades` (optional): Array of trades to auto-execute. Each trade goes through the same validation as manual trades (sufficient cash for buys, sufficient shares for sells)
-- `watchlist_changes` (optional): Array of watchlist modifications
+- `watchlist_changes` (optional): Array of watchlist modifications. `action` is an enum: `"add"` | `"remove"`
+- `errors` (optional): Array of execution failures populated by the backend after attempting trades. The backend fills this field — the LLM does not generate it. Each entry has `ticker` and `reason`. The frontend displays errors inline in the chat panel alongside the message.
 
 ### Auto-Execution
 
@@ -325,7 +348,7 @@ Trades specified by the LLM execute automatically — no confirmation dialog. Th
 - It creates an impressive, fluid demo experience
 - It demonstrates agentic AI capabilities — the core theme of the course
 
-If a trade fails validation (e.g., insufficient cash), the error is included in the chat response so the LLM can inform the user.
+If a trade fails validation (e.g., insufficient cash), the backend populates the `errors` array in the response. The frontend displays these errors inline in the chat panel.
 
 ### System Prompt Guidance
 
@@ -357,7 +380,7 @@ The frontend is a single-page application with a dense, terminal-inspired layout
 - **Portfolio heatmap** — treemap visualization where each rectangle is a position, sized by portfolio weight, colored by P&L (green = profit, red = loss)
 - **P&L chart** — line chart showing total portfolio value over time, using data from `portfolio_snapshots`
 - **Positions table** — tabular view of all positions: ticker, quantity, avg cost, current price, unrealized P&L, % change
-- **Trade bar** — simple input area: ticker field, quantity field, buy button, sell button. Market orders, instant fill.
+- **Trade bar** — simple input area: ticker field, quantity field (fractional shares supported, e.g. `0.5`), buy button, sell button. Market orders, instant fill.
 - **AI chat panel** — docked/collapsible sidebar. Message input, scrolling conversation history, loading indicator while waiting for LLM response. Trade executions and watchlist changes shown inline as confirmations.
 - **Header** — portfolio total value (updating live), connection status indicator, cash balance
 
@@ -376,20 +399,24 @@ The frontend is a single-page application with a dense, terminal-inspired layout
 ### Multi-Stage Dockerfile
 
 ```
-Stage 1: Node 20 slim
+Stage 1 (AS frontend-build): Node 20 slim
+  - WORKDIR /build/frontend
   - Copy frontend/
-  - npm install && npm run build (produces static export)
+  - npm install && npm run build (produces static export in /build/frontend/out)
 
-Stage 2: Python 3.12 slim
+Stage 2 (AS app): Python 3.12 slim
+  - WORKDIR /app
   - Install uv
-  - Copy backend/
+  - Copy backend/ to /app/backend/
   - uv sync (install Python dependencies from lockfile)
-  - Copy frontend build output into a static/ directory
+  - COPY --from=frontend-build /build/frontend/out /app/static/
   - Expose port 8000
-  - CMD: uvicorn serving FastAPI app
+  - CMD: uvicorn backend.main:app --host 0.0.0.0 --port 8000
 ```
 
 FastAPI serves the static frontend files and all API routes on port 8000.
+
+The container's working directory is `/app`. The backend expects `.env` at `/app/.env` — passed in via `--env-file .env` on `docker run` (so it is never baked into the image). Environment variables set via `--env-file` are available to the process directly; the backend reads them with `os.getenv` / `python-dotenv` loaded from `/app/.env`.
 
 ### Docker Volume
 
@@ -454,3 +481,14 @@ The container is designed to deploy to AWS App Runner, Render, or any container 
 - Portfolio visualization: heatmap renders with correct colors, P&L chart has data points
 - AI chat (mocked): send a message, receive a response, trade execution appears inline
 - SSE resilience: disconnect and verify reconnection
+
+---
+
+## 13. Deferred Decisions
+
+The following items are intentionally deferred until initial product code exists:
+
+- **Mock LLM fixture**: Define the deterministic response payload (including a sample trade action) once the chat route and E2E tests are being written.
+- **Frontend chart data source**: Decide whether the main chart uses SSE-accumulated in-memory history or a new per-ticker history endpoint once the frontend is being built.
+- **"Daily change %" baseline**: Define what "daily" means in a simulated context (since page load, since seed price, or simulated previous close) when the watchlist component is implemented.
+- **Chat panel open/collapsed default**: Confirm at build time; current intent is open on first launch based on the UX description.
